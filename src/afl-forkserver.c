@@ -100,6 +100,7 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
   fsrv->init_tmout = EXEC_TIMEOUT * FORK_WAIT_MULT;
   fsrv->mem_limit = MEM_LIMIT;
   fsrv->out_file = NULL;
+  fsrv->multi_file_num = 0;
   fsrv->child_kill_signal = SIGKILL;
 
   /* exec related stuff */
@@ -129,6 +130,7 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
   fsrv_to->real_map_size = from->real_map_size;
   fsrv_to->support_shmem_fuzz = from->support_shmem_fuzz;
   fsrv_to->out_file = from->out_file;
+  fsrv_to->multi_file_num = from->multi_file_num;
   fsrv_to->dev_urandom_fd = from->dev_urandom_fd;
   fsrv_to->out_fd = from->out_fd;  // not sure this is a good idea
   fsrv_to->no_unlink = from->no_unlink;
@@ -1346,25 +1348,49 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
 
     s32 fd = fsrv->out_fd;
 
+    s32 *multi_fd = malloc(sizeof(s32) * fsrv->multi_file_num);
     if (!fsrv->use_stdin && fsrv->out_file) {
+      if (fsrv->multi_file_num) {
+        for (u64 i = 0; i < fsrv->multi_file_num; i++) {
+          // create new fds for each file
+          int out_file_name_length =
+              snprintf(NULL, 0, "%lld", i) + strlen(fsrv->out_file) + 1;
+          u8 *out_file_name = malloc(sizeof(u8) * out_file_name_length);
+          strcpy(out_file_name, fsrv->out_file);
 
-      if (unlikely(fsrv->no_unlink)) {
+          if (i != 0) {
+            sprintf(out_file_name + strlen(fsrv->out_file), "%lld", i);
+          }
 
-        fd = open(fsrv->out_file, O_WRONLY | O_CREAT | O_TRUNC,
-                  DEFAULT_PERMISSION);
+          if (unlikely(fsrv->no_unlink)) {
+            multi_fd[i] = open(out_file_name, O_WRONLY | O_CREAT | O_TRUNC,
+                               DEFAULT_PERMISSION);
 
+          } else {
+            unlink(out_file_name); /* Ignore errors. */
+            multi_fd[i] = open(out_file_name, O_WRONLY | O_CREAT | O_EXCL,
+                               DEFAULT_PERMISSION);
+          }
+          // printf("Outfile %s created", out_file_name);
+          if (multi_fd[i] < 0) {
+            PFATAL("Unable to create '%s'", out_file_name);
+          }
+          free(out_file_name);
+        }
       } else {
+        if (unlikely(fsrv->no_unlink)) {
+          fd = open(fsrv->out_file, O_WRONLY | O_CREAT | O_TRUNC,
+                    DEFAULT_PERMISSION);
 
-        unlink(fsrv->out_file);                           /* Ignore errors. */
-        fd = open(fsrv->out_file, O_WRONLY | O_CREAT | O_EXCL,
-                  DEFAULT_PERMISSION);
+        } else {
+          unlink(fsrv->out_file); /* Ignore errors. */
+          fd = open(fsrv->out_file, O_WRONLY | O_CREAT | O_EXCL,
+                    DEFAULT_PERMISSION);
+        }
 
+        if (fd < 0) { PFATAL("Unable to create '%s'", fsrv->out_file); }
       }
-
-      if (fd < 0) { PFATAL("Unable to create '%s'", fsrv->out_file); }
-
     } else if (unlikely(fd <= 0)) {
-
       // We should have a (non-stdin) fd at this point, else we got a problem.
       FATAL(
           "Nowhere to write output to (neither out_fd nor out_file set (fd is "
@@ -1372,13 +1398,29 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
           fd);
 
     } else {
-
-      lseek(fd, 0, SEEK_SET);
-
+      if (fsrv->multi_file_num) {
+        // seek all fds
+        for (u64 i = 0; i < fsrv->multi_file_num; i++) {
+          lseek(multi_fd[i], 0, SEEK_SET);
+        }
+      } else {
+        lseek(fd, 0, SEEK_SET);
+      }
     }
 
     // fprintf(stderr, "WRITE %d %u\n", fd, len);
-    ck_write(fd, buf, len, fsrv->out_file);
+    if (fsrv->multi_file_num) {
+      // write to all fds in equal parts
+      u64 part_size = len / fsrv->multi_file_num;
+      u64 written = 0;
+      for (u64 i = 0; i < fsrv->multi_file_num; i++) {
+        ck_write(multi_fd[i], (buf + written), part_size,
+                 fsrv->out_file);
+        written += part_size;
+      }
+    } else {
+      ck_write(fd, buf, len, fsrv->out_file);
+    }
 
     if (fsrv->use_stdin) {
 
@@ -1386,9 +1428,14 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
       lseek(fd, 0, SEEK_SET);
 
     } else {
-
-      close(fd);
-
+      if (fsrv->multi_file_num) {
+        // seek all fds
+        for (u64 i = 0; i < fsrv->multi_file_num; i++) {
+          close(multi_fd[i]);
+        }
+      } else {
+        close(fd);
+      }
     }
 
   }

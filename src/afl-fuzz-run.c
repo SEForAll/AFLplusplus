@@ -182,6 +182,7 @@ static void write_with_gap(afl_state_t *afl, u8 *mem, u32 len, u32 skip_at,
                            u32 skip_len) {
 
   s32 fd = afl->fsrv.out_fd;
+  s32 *multi_fd = malloc(sizeof(s32) * afl->fsrv.multi_file_num);
   u32 tail_len = len - skip_at - skip_len;
 
   /*
@@ -286,38 +287,80 @@ static void write_with_gap(afl_state_t *afl, u8 *mem, u32 len, u32 skip_at,
     return;
 
   } else if (unlikely(!afl->fsrv.use_stdin)) {
+    if (afl->fsrv.multi_file_num) {
+      for (u64 i = 0; i < afl->fsrv.multi_file_num; i++) {
+        // create new fds for each file
+        int out_file_name_length = snprintf(NULL, 0,"%lld",i) + strlen(afl->fsrv.out_file) + 1;
+        u8 *out_file_name = malloc(sizeof(u8) * out_file_name_length);
+        strcpy(out_file_name, afl->fsrv.out_file);
 
-    if (unlikely(afl->no_unlink)) {
+        if (i != 0) {
+          sprintf(out_file_name + strlen(afl->fsrv.out_file), "%lld", i);
+        }
 
-      fd = open(afl->fsrv.out_file, O_WRONLY | O_CREAT | O_TRUNC,
-                DEFAULT_PERMISSION);
+        if (unlikely(afl->no_unlink)) {
+          multi_fd[i] = open(out_file_name, O_WRONLY | O_CREAT | O_TRUNC,
+                    DEFAULT_PERMISSION);
 
+        } else {
+          unlink(out_file_name); /* Ignore errors. */
+          multi_fd[i] = open(out_file_name, O_WRONLY | O_CREAT | O_EXCL,
+                    DEFAULT_PERMISSION);
+        }
+        // printf("Outfile %s created", out_file_name);
+        if (multi_fd[i] < 0) { PFATAL("Unable to create '%s'", out_file_name); }
+        free(out_file_name);
+      }
     } else {
+      if (unlikely(afl->no_unlink)) {
+        fd = open(afl->fsrv.out_file, O_WRONLY | O_CREAT | O_TRUNC,
+                  DEFAULT_PERMISSION);
 
-      unlink(afl->fsrv.out_file);                         /* Ignore errors. */
-      fd = open(afl->fsrv.out_file, O_WRONLY | O_CREAT | O_EXCL,
-                DEFAULT_PERMISSION);
+      } else {
+        unlink(afl->fsrv.out_file); /* Ignore errors. */
+        fd = open(afl->fsrv.out_file, O_WRONLY | O_CREAT | O_EXCL,
+                  DEFAULT_PERMISSION);
+      }
 
+      if (fd < 0) { PFATAL("Unable to create '%s'", afl->fsrv.out_file); }
     }
-
-    if (fd < 0) { PFATAL("Unable to create '%s'", afl->fsrv.out_file); }
-
   } else {
-
-    lseek(fd, 0, SEEK_SET);
-
+    if (afl->fsrv.multi_file_num) {
+      // seek all fds
+      for (u64 i = 0; i < afl->fsrv.multi_file_num; i++) {
+        lseek(multi_fd[i], 0, SEEK_SET);
+      }
+    } else {
+      lseek(fd, 0, SEEK_SET);
+    }
   }
 
   if (!post_process_skipped) {
-
-    ck_write(fd, new_mem, new_size, afl->fsrv.out_file);
-
+    if (afl->fsrv.multi_file_num) {
+      // write to all fds in equal parts
+      u64 part_size = new_size / afl->fsrv.multi_file_num;
+      u64 written = 0;
+      for (u64 i = 0; i < afl->fsrv.multi_file_num; i++) {
+        ck_write(multi_fd[i], (new_mem + written), part_size, afl->fsrv.out_file);
+        written += part_size;
+      }
+    } else {
+      ck_write(fd, new_mem, new_size, afl->fsrv.out_file);
+    }
   } else {
+    if (afl->fsrv.multi_file_num) {
+      // we ignore the gap for this functionality
+      u64 part_size = new_size / afl->fsrv.multi_file_num;
+      u64 written = 0;
+      for (u64 i = 0; i < afl->fsrv.multi_file_num; i++) {
+        ck_write(multi_fd[i], (new_mem + written), part_size, afl->fsrv.out_file);
+        written += part_size;
+      }
+    } else {
+      ck_write(fd, mem, skip_at, afl->fsrv.out_file);
 
-    ck_write(fd, mem, skip_at, afl->fsrv.out_file);
-
-    ck_write(fd, mem + skip_at + skip_len, tail_len, afl->fsrv.out_file);
-
+      ck_write(fd, mem + skip_at + skip_len, tail_len, afl->fsrv.out_file);
+    }
   }
 
   if (afl->fsrv.use_stdin) {
@@ -326,9 +369,14 @@ static void write_with_gap(afl_state_t *afl, u8 *mem, u32 len, u32 skip_at,
     lseek(fd, 0, SEEK_SET);
 
   } else {
-
-    close(fd);
-
+    if (afl->fsrv.multi_file_num) {
+      // seek all fds
+      for (u64 i = 0; i < afl->fsrv.multi_file_num; i++) {
+        close(multi_fd[i]);
+      }
+    } else {
+      close(fd);
+    }
   }
 
 }
